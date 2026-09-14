@@ -120,6 +120,10 @@ type qemu struct {
 
 	stopped int32
 
+	// qemuExited is closed after a QEMU process launched by this shim has
+	// been reaped. It is nil when the shim restored an existing sandbox.
+	qemuExited chan struct{}
+
 	mu sync.Mutex
 }
 
@@ -1677,7 +1681,7 @@ func (q *qemu) setupEarlyQmpConnection() (net.Conn, error) {
 	return conn, nil
 }
 
-func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser) {
+func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser, exited chan struct{}) {
 	pid := qemuCmd.Process.Pid
 	q.Logger().Infof("Start logging QEMU (qemuPid=%d)", pid)
 	scanner := bufio.NewScanner(reader)
@@ -1692,7 +1696,9 @@ func (q *qemu) LogAndWait(qemuCmd *exec.Cmd, reader io.ReadCloser) {
 		}
 	}
 	q.Logger().WithField("qemuPid", pid).Infof("Stop logging QEMU")
-	if err := qemuCmd.Wait(); err != nil {
+	err := qemuCmd.Wait()
+	close(exited)
+	if err != nil {
 		q.Logger().WithField("qemuPid", pid).WithField("error", err).Warn("QEMU exited with an error")
 	}
 }
@@ -1777,7 +1783,8 @@ func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 
 	// Log QEMU errors and ensure the QEMU process is reaped after
 	// termination.
-	go q.LogAndWait(qemuCmd, reader)
+	q.qemuExited = make(chan struct{})
+	go q.LogAndWait(qemuCmd, reader, q.qemuExited)
 
 	err = q.waitVM(ctx, qmpConn, timeout)
 	if err != nil {
@@ -1897,17 +1904,12 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	}
 	pid := pids[0]
 	if pid > 0 {
-		if waitOnly {
-			err := utils.WaitLocalProcess(pid, qemuStopSandboxTimeoutSecs, syscall.Signal(0), q.Logger())
-			if err != nil {
-				return err
-			}
-		} else {
-			err = syscall.Kill(pid, syscall.SIGKILL)
-			if err != nil {
-				q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
-				return err
-			}
+		// Sandbox teardown restores physical endpoints immediately after
+		// StopVM returns. Wait for QEMU to release its VFIO file descriptors
+		// before allowing that rebind to begin.
+		if err := q.waitForQEMUExit(pid, waitOnly); err != nil {
+			q.Logger().WithError(err).Error("Failed to stop QEMU")
+			return err
 		}
 	}
 
@@ -1917,6 +1919,52 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 		}
 	}
 
+	return nil
+}
+
+func (q *qemu) waitForQEMUExit(pid int, waitOnly bool) error {
+	// A shim restoring existing sandbox state does not own the QEMU child,
+	// so retain the existing PID-based stop behavior for that case.
+	if q.qemuExited == nil {
+		initialSignal := syscall.Signal(0)
+		if !waitOnly {
+			initialSignal = syscall.SIGKILL
+		}
+		return utils.WaitLocalProcess(pid, qemuStopSandboxTimeoutSecs, initialSignal, q.Logger())
+	}
+
+	select {
+	case <-q.qemuExited:
+		return nil
+	default:
+	}
+
+	if waitOnly {
+		timer := time.NewTimer(time.Duration(qemuStopSandboxTimeoutSecs) * time.Second)
+		select {
+		case <-q.qemuExited:
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+
+		// QEMU may have exited concurrently with the grace timer. Check the
+		// reaper again before signaling the PID.
+		select {
+		case <-q.qemuExited:
+			return nil
+		default:
+		}
+	}
+
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		return err
+	}
+
+	// Do not use the caller context or a second timeout here. Returning before
+	// the reaper confirms exit would allow network teardown to race QEMU's
+	// still-open VFIO descriptors again.
+	<-q.qemuExited
 	return nil
 }
 

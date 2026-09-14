@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -46,6 +47,38 @@ func newQemuConfig() HypervisorConfig {
 		DefaultMaxVCPUs:     defaultMaxVCPUs,
 		Msize9p:             defaultMsize9p,
 		DisableGuestSeLinux: defaultDisableGuestSeLinux,
+	}
+}
+
+func TestQemuWaitForQEMUExitAfterKill(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if !assert.NoError(t, cmd.Start()) {
+		return
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+	}()
+
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+
+	q := &qemu{qemuExited: exited}
+	assert.NoError(t, q.waitForQEMUExit(cmd.Process.Pid, false))
+	assert.True(t, cmd.ProcessState.Exited())
+}
+
+func TestQemuWaitForQEMUAlreadyExited(t *testing.T) {
+	for _, waitOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wait-only-%t", waitOnly), func(t *testing.T) {
+			exited := make(chan struct{})
+			close(exited)
+
+			q := &qemu{qemuExited: exited}
+			assert.NoError(t, q.waitForQEMUExit(1<<30, waitOnly))
+		})
 	}
 }
 
