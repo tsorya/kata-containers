@@ -18,8 +18,9 @@ import (
 var MockHybridVSockPath = "/tmp/kata-mock-hybrid-vsock.socket"
 
 type mockHypervisor struct {
-	config  HypervisorConfig
-	mockPid int
+	config     HypervisorConfig
+	mockPid    int
+	stopVMFunc func(context.Context, bool) error
 }
 
 func (m *mockHypervisor) Capabilities(ctx context.Context) types.Capabilities {
@@ -50,6 +51,9 @@ func (m *mockHypervisor) StartVM(ctx context.Context, timeout int) error {
 }
 
 func (m *mockHypervisor) StopVM(ctx context.Context, waitOnly bool) error {
+	if m.stopVMFunc != nil {
+		return m.stopVMFunc(ctx, waitOnly)
+	}
 	return nil
 }
 
