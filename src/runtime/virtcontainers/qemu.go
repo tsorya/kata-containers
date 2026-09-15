@@ -1881,19 +1881,20 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	}
 
 	defer func() {
-		q.cleanupVM()
-		if err == nil {
-			atomic.StoreInt32(&q.stopped, 1)
+		if err != nil {
+			return
 		}
+		q.cleanupVM()
+		atomic.StoreInt32(&q.stopped, 1)
 	}()
 
 	if err := q.qmpSetup(); err != nil {
-		return err
+		return fmt.Errorf("%w: set up QMP: %v", errVMMExitUnconfirmed, err)
 	}
 
 	pids := q.GetPids()
 	if len(pids) == 0 {
-		return errors.New("cannot determine QEMU PID")
+		return fmt.Errorf("%w: cannot determine QEMU PID", errVMMExitUnconfirmed)
 	}
 	pid := pids[0]
 	if pid > 0 {
@@ -1901,16 +1902,14 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 			err = syscall.Kill(pid, syscall.SIGKILL)
 			if err != nil {
 				q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
-				return err
+				return fmt.Errorf("%w: send SIGKILL to QEMU process %d: %v", errVMMExitUnconfirmed, pid, err)
 			}
 		}
 		// Wait for QEMU to actually exit regardless of whether we issued the kill syscall.
-		// Without this, the caller may proceeds to delete the sandbox cgroup while QEMU threads
+		// Without this, the caller may proceed to delete the sandbox cgroup while QEMU threads
 		// are still alive in it, making the cgroup undeletable.
 		if err := utils.WaitLocalProcess(pid, qemuStopSandboxTimeoutSecs, syscall.Signal(0), q.Logger()); err != nil {
-			if waitOnly {
-				return err
-			}
+			return fmt.Errorf("%w: wait for QEMU process %d: %v", errVMMExitUnconfirmed, pid, err)
 		}
 	}
 

@@ -1146,7 +1146,12 @@ func (s *service) processExits() {
 func (s *service) checkProcesses(e exit) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sendExitEvent(e)
+}
 
+// sendExitEvent publishes a TaskExit event. The caller must hold s.mu so the
+// event remains ordered with task state changes and Delete RPCs.
+func (s *service) sendExitEvent(e exit) {
 	id := e.execid
 	if id == "" {
 		id = e.id
