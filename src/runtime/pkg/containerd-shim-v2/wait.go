@@ -63,6 +63,7 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 	timeStamp := time.Now()
 
 	if execID == "" {
+		isSandbox := c.cType.IsSandbox()
 		s.mu.Lock()
 		c.status = task.Status_STOPPED
 		c.exit = uint32(ret)
@@ -70,7 +71,7 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 
 		// Cancel the sandbox watcher while holding s.mu so we do not race
 		// with watchSandbox()'s own (killed-VMM) teardown path.
-		if c.cType.IsSandbox() && s.monitor != nil {
+		if isSandbox && s.monitor != nil {
 			shimLog.WithField("sandbox", s.sandbox.ID()).Info("cancel watcher")
 			s.monitor <- nil
 		}
@@ -81,7 +82,9 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		// counter and let the shim exit before the teardown even started.
 		s.teardownWg.Add(1)
 		defer s.teardownWg.Done()
-		s.mu.Unlock()
+		if !isSandbox {
+			s.mu.Unlock()
+		}
 
 		// Publish the exit code and TaskExit event *before* the sandbox
 		// teardown.  Docker/containerd rely on the TaskExit event, not only on
@@ -95,21 +98,21 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		}).Info("Publishing container exit status")
 		shimLog.WithField("container", c.id).Debug("The container status is StatusStopped")
 
-		go cReap(s, int(ret), c.id, execID, timeStamp)
+		if isSandbox {
+			// Enqueue TaskExit synchronously while holding s.mu. This preserves
+			// event ordering and ensures containerd can observe the exit before
+			// the potentially slow sandbox teardown starts.
+			s.sendExitEvent(exit{
+				timestamp: timeStamp,
+				pid:       s.hpid,
+				status:    int(ret),
+				id:        c.id,
+				execid:    execID,
+			})
 
-		// Tear the sandbox down synchronously but *without* holding s.mu.
-		// Holding s.mu across the (slow) guest shutdown blocks the Delete()
-		// RPC that containerd issues right after the early TaskExit above;
-		// containerd then gives up on a clean Delete/Shutdown and runs the
-		// `shim delete` binary, which re-connects to the now-dead agent and
-		// hangs until killed -- surfacing as a failed `docker run --rm`.
-		//
-		// Shutdown() waits on teardownWg instead, so the sandbox run
-		// directory (watched by kata-monitor) is still removed before the
-		// shim exits.  teardownOnce serializes with watchSandbox()'s
-		// killed-VMM teardown so the (not internally synchronized)
-		// Sandbox.Stop/Delete never run concurrently.
-		if c.cType.IsSandbox() {
+			// Keep s.mu held across teardown. watchSandbox uses the same lock
+			// order (s.mu, then teardownOnce), which serializes Sandbox
+			// Stop/Delete with service RPCs without introducing a lock cycle.
 			s.teardownOnce.Do(func() {
 				if err = s.sandbox.Stop(ctx, true); err != nil {
 					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
@@ -119,7 +122,10 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
 				}
 			})
+			s.mu.Unlock()
 		} else {
+			go cReap(s, int(ret), c.id, execID, timeStamp)
+
 			if _, err = s.sandbox.StopContainer(ctx, c.id, true); err != nil {
 				shimLog.WithError(err).WithField("container", c.id).Warn("stop container failed")
 			}
