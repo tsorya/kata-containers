@@ -1897,17 +1897,9 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	}
 	pid := pids[0]
 	if pid > 0 {
-		if waitOnly {
-			err := utils.WaitLocalProcess(pid, qemuStopSandboxTimeoutSecs, syscall.Signal(0), q.Logger())
-			if err != nil {
-				return err
-			}
-		} else {
-			err = syscall.Kill(pid, syscall.SIGKILL)
-			if err != nil {
-				q.Logger().WithError(err).Error("Fail to send SIGKILL to qemu")
-				return err
-			}
+		if err := q.waitForQEMUExit(pid, waitOnly); err != nil {
+			q.Logger().WithError(err).Error("Failed to stop QEMU")
+			return err
 		}
 	}
 
@@ -1918,6 +1910,109 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 	}
 
 	return nil
+}
+
+// waitForQEMUExit waits until QEMU has released all of its resources without
+// reaping it. LogAndWait remains the sole reaper for QEMU processes launched by
+// this shim, while pidfd polling also works when the shim restored an existing
+// sandbox and QEMU is not its child.
+func (q *qemu) waitForQEMUExit(pid int, waitOnly bool) error {
+	gracePeriod := time.Duration(0)
+	if waitOnly {
+		gracePeriod = time.Duration(qemuStopSandboxTimeoutSecs) * time.Second
+	}
+
+	return q.waitForQEMUExitWithGracePeriod(pid, gracePeriod)
+}
+
+func (q *qemu) waitForQEMUExitWithGracePeriod(pid int, gracePeriod time.Duration) error {
+	pidfd, err := unix.PidfdOpen(pid, 0)
+	if err == unix.ESRCH {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open pidfd for QEMU process %d: %w", pid, err)
+	}
+	defer unix.Close(pidfd)
+
+	if gracePeriod > 0 {
+		exited, err := pollPidfd(pidfd, gracePeriod)
+		if err != nil {
+			return fmt.Errorf("wait for QEMU process %d: %w", pid, err)
+		}
+		if exited {
+			return nil
+		}
+	}
+
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0); err != nil {
+		if err == unix.ESRCH {
+			return nil
+		}
+		return fmt.Errorf("send SIGKILL to QEMU process %d: %w", pid, err)
+	}
+
+	// Returning before QEMU exits would allow physical endpoint teardown to
+	// race its still-open VFIO descriptors. Do not use a timeout or the caller
+	// context after SIGKILL.
+	exited, err := pollPidfd(pidfd, -1)
+	if err != nil {
+		return fmt.Errorf("wait for killed QEMU process %d: %w", pid, err)
+	}
+	if !exited {
+		return fmt.Errorf("wait for killed QEMU process %d returned before exit", pid)
+	}
+
+	return nil
+}
+
+// pollPidfd waits for a process-exit event without consuming it. A negative
+// timeout waits indefinitely. Finite waits use a deadline so an interrupted
+// poll does not restart the complete timeout.
+func pollPidfd(pidfd int, timeout time.Duration) (bool, error) {
+	var deadline time.Time
+	if timeout >= 0 {
+		deadline = time.Now().Add(timeout)
+	}
+
+	firstPoll := true
+	for {
+		pollTimeout := -1
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if !firstPoll {
+					return false, nil
+				}
+				pollTimeout = 0
+			} else {
+				// unix.Poll takes milliseconds. Round up so a positive remaining
+				// duration does not become an immediate poll.
+				pollTimeout = int((remaining + time.Millisecond - 1) / time.Millisecond)
+			}
+		}
+
+		pollFds := []unix.PollFd{{Fd: int32(pidfd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pollFds, pollTimeout)
+		firstPoll = false
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+
+		revents := pollFds[0].Revents
+		if revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+			return true, nil
+		}
+		if revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			return false, fmt.Errorf("unexpected pidfd poll events: %#x", revents)
+		}
+	}
 }
 
 func (q *qemu) cleanupVM() error {

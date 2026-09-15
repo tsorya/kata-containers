@@ -17,10 +17,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/govmm"
@@ -32,6 +35,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/sys/unix"
 )
 
 func newQemuConfig() HypervisorConfig {
@@ -47,6 +51,108 @@ func newQemuConfig() HypervisorConfig {
 		Msize9p:             defaultMsize9p,
 		DisableGuestSeLinux: defaultDisableGuestSeLinux,
 	}
+}
+
+func TestQemuWaitForQEMUExitDoesNotReap(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if !assert.NoError(t, cmd.Start()) {
+		return
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+
+	q := &qemu{}
+	if !assert.NoError(t, q.waitForQEMUExit(cmd.Process.Pid, false)) {
+		return
+	}
+
+	err := cmd.Wait()
+	if assert.Error(t, err) {
+		_, ok := err.(*exec.ExitError)
+		assert.True(t, ok, "cmd.Wait should observe QEMU's SIGKILL exit, got %T", err)
+	}
+	waitStatus, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if assert.True(t, ok) {
+		assert.True(t, waitStatus.Signaled())
+		assert.Equal(t, syscall.SIGKILL, waitStatus.Signal())
+	}
+}
+
+func TestQemuWaitForQEMUExitGracefullyDoesNotReap(t *testing.T) {
+	cmd := exec.Command("true")
+	if !assert.NoError(t, cmd.Start()) {
+		return
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+
+	q := &qemu{}
+	if !assert.NoError(t, q.waitForQEMUExit(cmd.Process.Pid, true)) {
+		return
+	}
+	assert.NoError(t, cmd.Wait())
+	assert.True(t, cmd.ProcessState.Success())
+}
+
+func TestQemuWaitForQEMUExitGracePeriodEscalates(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if !assert.NoError(t, cmd.Start()) {
+		return
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+
+	q := &qemu{}
+	if !assert.NoError(t, q.waitForQEMUExitWithGracePeriod(cmd.Process.Pid, 10*time.Millisecond)) {
+		return
+	}
+
+	err := cmd.Wait()
+	if assert.Error(t, err) {
+		waitStatus, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+		if assert.True(t, ok) {
+			assert.True(t, waitStatus.Signaled())
+			assert.Equal(t, syscall.SIGKILL, waitStatus.Signal())
+		}
+	}
+}
+
+func TestPollPidfdTimeoutDoesNotReap(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if !assert.NoError(t, cmd.Start()) {
+		return
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	pidfd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer unix.Close(pidfd)
+
+	exited, err := pollPidfd(pidfd, 10*time.Millisecond)
+	assert.NoError(t, err)
+	assert.False(t, exited)
+}
+
+func TestQemuWaitForQEMUExitAlreadyExited(t *testing.T) {
+	q := &qemu{}
+	assert.NoError(t, q.waitForQEMUExit(1<<30, false))
 }
 
 func testQemuKernelParameters(t *testing.T, kernelParams []Param, expected string, debug bool, confidentialGuest bool) {
