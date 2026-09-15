@@ -62,6 +62,10 @@ var sandboxTracingTags = map[string]string{
 	"subsystem": "sandbox",
 }
 
+// errVMMExitUnconfirmed marks failures where host-side device teardown cannot
+// safely continue because the VMM may still hold device file descriptors.
+var errVMMExitUnconfirmed = errors.New("VMM exit was not confirmed")
+
 const (
 	// VmStartTimeout represents the time in seconds a sandbox can wait before
 	// to consider the VM starting operation failed.
@@ -2222,8 +2226,13 @@ func (s *Sandbox) Stop(ctx context.Context, force bool) error {
 		}
 	}
 
-	if err := s.stopVM(ctx); err != nil && !force {
-		return err
+	if err := s.stopVM(ctx); err != nil {
+		// A force stop may ignore guest-related or post-exit cleanup failures,
+		// but physical endpoint teardown below must not rebind a VF while the
+		// VMM may still hold its VFIO file descriptor.
+		if !force || errors.Is(err, errVMMExitUnconfirmed) {
+			return err
+		}
 	}
 
 	// shutdown console watcher if exists

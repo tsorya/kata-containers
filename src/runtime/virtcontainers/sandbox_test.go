@@ -1409,6 +1409,29 @@ func TestSandboxStopStopped(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+func TestSandboxForceStopReturnsVMStopErrorBeforeNetworkTeardown(t *testing.T) {
+	stopErr := fmt.Errorf("%w: test failure", errVMMExitUnconfirmed)
+	s := &Sandbox{
+		id:         testSandboxID,
+		ctx:        context.Background(),
+		state:      types.SandboxState{State: types.StateReady},
+		containers: make(map[string]*Container),
+		agent:      NewMockAgent(),
+		hypervisor: &mockHypervisor{
+			stopVMFunc: func(context.Context, bool) error {
+				return stopErr
+			},
+		},
+	}
+
+	stateBeforeStop := s.state.State
+	err := s.Stop(context.Background(), true)
+
+	assert.ErrorIs(t, err, stopErr)
+	assert.Equal(t, stateBeforeStop, s.state.State,
+		"sandbox must not transition to stopped or remove networking after a VMM stop failure")
+}
+
 func checkDirNotExist(path string) error {
 	if _, err := os.Stat(path); os.IsExist(err) {
 		return fmt.Errorf("%s is still exists", path)
