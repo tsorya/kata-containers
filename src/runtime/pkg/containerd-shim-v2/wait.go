@@ -83,23 +83,31 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		defer s.teardownWg.Done()
 		s.mu.Unlock()
 
-		// Publish the exit code and TaskExit event *before* the sandbox
-		// teardown.  Docker/containerd rely on the TaskExit event, not only on
-		// the Wait RPC; if teardown (a potentially slow guest shutdown) ran
-		// first, containerd could SIGKILL the shim before the exit was
-		// published, surfacing exit code 255.
-		c.exitCh <- uint32(ret)
-		shimLog.WithFields(logrus.Fields{
-			"container": c.id,
-			"exit-code": ret,
-		}).Info("Publishing container exit status")
-		shimLog.WithField("container", c.id).Debug("The container status is StatusStopped")
+		publishExitStatus := func() {
+			// Publish TaskExit while holding s.mu, before exposing the Wait
+			// response. This prevents a concurrent Delete RPC from publishing
+			// TaskDelete first.
+			s.mu.Lock()
+			s.sendExitEvent(exit{
+				timestamp: timeStamp,
+				pid:       s.hpid,
+				status:    int(ret),
+				id:        c.id,
+				execid:    execID,
+			})
+			s.mu.Unlock()
 
-		go cReap(s, int(ret), c.id, execID, timeStamp)
+			c.exitCh <- uint32(ret)
+			shimLog.WithFields(logrus.Fields{
+				"container": c.id,
+				"exit-code": ret,
+			}).Info("Publishing container exit status")
+			shimLog.WithField("container", c.id).Debug("The container status is StatusStopped")
+		}
 
 		// Tear the sandbox down synchronously but *without* holding s.mu.
 		// Holding s.mu across the (slow) guest shutdown blocks the Delete()
-		// RPC that containerd issues right after the early TaskExit above;
+		// RPC that containerd issues after TaskExit;
 		// containerd then gives up on a clean Delete/Shutdown and runs the
 		// `shim delete` binary, which re-connects to the now-dead agent and
 		// hangs until killed -- surfacing as a failed `docker run --rm`.
@@ -110,16 +118,29 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		// killed-VMM teardown so the (not internally synchronized)
 		// Sandbox.Stop/Delete never run concurrently.
 		if c.cType.IsSandbox() {
+			published := false
 			s.teardownOnce.Do(func() {
 				if err = s.sandbox.Stop(ctx, true); err != nil {
 					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to stop sandbox")
 				}
 
+				// Do not expose the stopped task until Stop has restored assigned
+				// devices. Containerd may start task deletion as soon as either the
+				// Wait response or TaskExit becomes visible.
+				publishExitStatus()
+				published = true
+
 				if err = s.sandbox.Delete(ctx); err != nil {
 					shimLog.WithField("sandbox", s.sandbox.ID()).Error("failed to delete sandbox")
 				}
 			})
+			if !published {
+				publishExitStatus()
+			}
 		} else {
+			publishExitStatus()
+			go cReap(s, int(ret), c.id, execID, timeStamp)
+
 			if _, err = s.sandbox.StopContainer(ctx, c.id, true); err != nil {
 				shimLog.WithError(err).WithField("container", c.id).Warn("stop container failed")
 			}
